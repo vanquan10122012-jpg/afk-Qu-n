@@ -1,0 +1,607 @@
+-- ============================================================
+-- Auto Candy Farm v6.2
+-- Modes: Walk | Tween | T↕ Skip (direction-aware) | Instant
+-- Clean build — no candy counter, no events, no dead code
+-- ============================================================
+
+local Players            = game:GetService("Players")
+local PathfindingService = game:GetService("PathfindingService")
+local RunService         = game:GetService("RunService")
+local UserInputService   = game:GetService("UserInputService")
+
+-- ------------------------------------------------------------
+-- PLAYER BINDING
+-- ------------------------------------------------------------
+local player = Players.LocalPlayer
+local character, hrp, humanoid
+
+local function bind(c)
+    character = c
+    hrp       = c:WaitForChild("HumanoidRootPart")
+    humanoid  = c:WaitForChild("Humanoid")
+end
+
+bind(player.Character or player.CharacterAdded:Wait())
+player.CharacterAdded:Connect(bind)
+
+-- ------------------------------------------------------------
+-- CONFIG & STATE
+-- ------------------------------------------------------------
+local CONFIG = {
+    mode            = "Walk",
+    speed           = 150,           -- Walk + Tween. Tween uncapped, Walk caps at 400 internally.
+    actionText      = "Open",
+    clickBurst      = 3,
+    scanInterval    = 0.3,
+    cooldownRadius  = 12,
+    cooldownSuccess = 3,
+    cooldownFail    = 12,
+    pathTimeout     = 15,
+    waypointTimeout = 5,
+    skyHeight       = 120,
+    flatThreshold   = 20,            -- 🆕 |ΔY| below this = "same level", skip vertical detour
+}
+
+local state     = { running = false, busy = false }
+local cooldowns = {}
+
+-- ------------------------------------------------------------
+-- HELPERS
+-- ------------------------------------------------------------
+local function now() return os.clock() end
+
+local function isHidden(pos)
+    return math.abs(pos.X) > 1e5 or math.abs(pos.Y) > 1e5 or math.abs(pos.Z) > 1e5
+end
+
+local function basePart(obj)
+    while obj and not obj:IsA("BasePart") do obj = obj.Parent end
+    return obj
+end
+
+local function cool(pos, duration, radius)
+    cooldowns[pos] = { t = now() + duration, r = radius or CONFIG.cooldownRadius }
+end
+
+local function isCooling(pos)
+    for p, c in pairs(cooldowns) do
+        if c.t < now() then
+            cooldowns[p] = nil
+        elseif (p - pos).Magnitude <= c.r then
+            return true
+        end
+    end
+    return false
+end
+
+-- ------------------------------------------------------------
+-- PROMPT SCANNER
+-- ------------------------------------------------------------
+local cache, lastScan = {}, 0
+
+local function scan()
+    if now() - lastScan < CONFIG.scanInterval then return cache end
+    lastScan = now()
+
+    cache = {}
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("ProximityPrompt")
+           and obj.Enabled
+           and obj.ActionText:lower() == CONFIG.actionText:lower() then
+            local part = basePart(obj.Parent)
+            if part and part.Parent and not isHidden(part.Position) then
+                cache[#cache + 1] = { prompt = obj, part = part, pos = part.Position }
+            end
+        end
+    end
+    return cache
+end
+
+-- ------------------------------------------------------------
+-- CORE TWEEN (single segment, no speed cap)
+-- ------------------------------------------------------------
+local function tweenTo(endPos)
+    if not state.running or not hrp or not hrp.Parent then return false end
+    local startPos = hrp.Position
+    local dist = (endPos - startPos).Magnitude
+    if dist < 0.5 then return true end
+
+    local speed    = math.max(CONFIG.speed, 1)
+    local duration = dist / speed
+    local elapsed  = 0
+
+    while elapsed < duration do
+        if not state.running or not hrp.Parent then return false end
+        elapsed += RunService.Heartbeat:Wait()
+        local alpha = math.min(elapsed / duration, 1)
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.CFrame = CFrame.new(startPos:Lerp(endPos, alpha))
+    end
+    return true
+end
+
+-- ------------------------------------------------------------
+-- PATHFINDER
+-- ------------------------------------------------------------
+local Pathfinder = {}
+
+function Pathfinder.compute(fromPos, toPos)
+    local spacing = math.max(4, math.min(20, CONFIG.speed / 12))
+
+    local path = PathfindingService:CreatePath({
+        AgentRadius     = 2,
+        AgentHeight     = 5,
+        AgentCanJump    = true,
+        AgentCanClimb   = false,
+        WaypointSpacing = spacing,
+    })
+
+    local ok = pcall(path.ComputeAsync, path, fromPos, toPos)
+    if not ok or path.Status ~= Enum.PathStatus.Success then
+        return nil
+    end
+    return path:GetWaypoints()
+end
+
+function Pathfinder.walk(waypoints)
+    local oldSpeed = humanoid.WalkSpeed
+    humanoid.WalkSpeed = math.clamp(CONFIG.speed, 16, 400)
+
+    local startedAt = now()
+
+    for i, wp in ipairs(waypoints) do
+        if not state.running or not hrp.Parent then
+            humanoid.WalkSpeed = oldSpeed
+            return false
+        end
+        if now() - startedAt > CONFIG.pathTimeout then
+            humanoid.WalkSpeed = oldSpeed
+            return false
+        end
+
+        if i > 1 then
+            if wp.Action == Enum.PathWaypointAction.Jump then
+                humanoid.Jump = true
+            end
+
+            humanoid:MoveTo(wp.Position)
+
+            local wpStart = now()
+            while now() - wpStart < CONFIG.waypointTimeout do
+                if not state.running or not hrp.Parent then
+                    humanoid.WalkSpeed = oldSpeed
+                    return false
+                end
+                if (hrp.Position - wp.Position).Magnitude <= 6 then
+                    break
+                end
+                task.wait(0.03)
+            end
+        end
+    end
+
+    humanoid.WalkSpeed = oldSpeed
+    return true
+end
+
+function Pathfinder.tween(waypoints)
+    for i, wp in ipairs(waypoints) do
+        if i == 1 then continue end
+        if not tweenTo(wp.Position) then return false end
+    end
+    return true
+end
+
+-- 🆕 Direction-aware vertical skip (works underground too)
+function Pathfinder.tweenUp(targetPos)
+    local dy    = targetPos.Y - hrp.Position.Y
+    local absDy = math.abs(dy)
+
+    -- Case A: same level → pure horizontal, no vertical waste
+    if absDy < CONFIG.flatThreshold then
+        local flatY = hrp.Position.Y + 3
+        if not tweenTo(Vector3.new(targetPos.X, flatY, targetPos.Z)) then return false end
+        if not tweenTo(targetPos + Vector3.new(0, 3, 0)) then return false end
+        return true
+    end
+
+    -- Case B: target ABOVE → ascend → horizontal → descend
+    if dy > 0 then
+        local skyY = targetPos.Y + CONFIG.skyHeight
+        if not tweenTo(Vector3.new(hrp.Position.X, skyY, hrp.Position.Z)) then return false end
+        if not tweenTo(Vector3.new(targetPos.X, skyY, targetPos.Z)) then return false end
+        if not tweenTo(targetPos + Vector3.new(0, 3, 0)) then return false end
+        return true
+    end
+
+    -- Case C: target BELOW → drop to just above target → horizontal → settle
+    local midY = targetPos.Y + CONFIG.skyHeight
+    if not tweenTo(Vector3.new(hrp.Position.X, midY, hrp.Position.Z)) then return false end
+    if not tweenTo(Vector3.new(targetPos.X, midY, targetPos.Z)) then return false end
+    if not tweenTo(targetPos + Vector3.new(0, 3, 0)) then return false end
+    return true
+end
+
+function Pathfinder.instant(pos)
+    if not hrp or not hrp.Parent then return end
+    local jitter = Vector3.new(
+        (math.random() - 0.5) * 2,
+        3,
+        (math.random() - 0.5) * 2
+    )
+    hrp.CFrame = CFrame.new(pos + jitter)
+end
+
+-- ------------------------------------------------------------
+-- UNIFIED MOVE (with fallback chain)
+-- ------------------------------------------------------------
+local function moveTo(targetPos)
+    if CONFIG.mode == "Instant" then
+        Pathfinder.instant(targetPos)
+        return true
+    end
+
+    if CONFIG.mode == "TweenUp" then
+        return Pathfinder.tweenUp(targetPos)
+    end
+
+    local waypoints = Pathfinder.compute(hrp.Position, targetPos)
+
+    if waypoints then
+        if CONFIG.mode == "Tween" then
+            return Pathfinder.tween(waypoints)
+        else
+            return Pathfinder.walk(waypoints)
+        end
+    end
+
+    -- No path → direct fallback
+    if CONFIG.mode == "Tween" then
+        return tweenTo(targetPos)
+    end
+
+    humanoid:MoveTo(targetPos)
+    local t0 = now()
+    while now() - t0 < CONFIG.waypointTimeout do
+        if not state.running then return false end
+        if (hrp.Position - targetPos).Magnitude <= 6 then return true end
+        task.wait(0.03)
+    end
+    return false
+end
+
+-- ------------------------------------------------------------
+-- TRIGGER PROMPT
+-- ------------------------------------------------------------
+local function fire(prompt)
+    if not prompt or not prompt.Parent then return end
+    for i = 1, CONFIG.clickBurst do
+        task.spawn(function()
+            pcall(fireproximityprompt, prompt, 1)
+        end)
+        if i < CONFIG.clickBurst then task.wait(0.02) end
+    end
+end
+
+-- ------------------------------------------------------------
+-- GUI — compact mobile-first
+-- ------------------------------------------------------------
+local gui = Instance.new("ScreenGui")
+gui.Name = "SpookyFarm"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 9999
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local scale = Instance.new("UIScale")
+scale.Parent = gui
+
+local W, H = 260, 320
+local function fitScale()
+    local vp = workspace.CurrentCamera.ViewportSize
+    scale.Scale = math.clamp(math.min((vp.X - 40) / W, (vp.Y - 60) / H), 0.65, 1.1)
+end
+workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(fitScale)
+fitScale()
+
+local main = Instance.new("Frame")
+main.Size = UDim2.fromOffset(W, H)
+main.Position = UDim2.new(0.5, -W/2, 0.5, -H/2)
+main.BackgroundColor3 = Color3.fromRGB(15, 10, 25)
+main.BorderSizePixel = 0
+main.Parent = gui
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 12)
+Instance.new("UIStroke", main).Color = Color3.fromRGB(255, 100, 0)
+
+-- Title bar
+local bar = Instance.new("Frame")
+bar.Size = UDim2.new(1, 0, 0, 34)
+bar.BackgroundColor3 = Color3.fromRGB(22, 14, 38)
+bar.BorderSizePixel = 0
+bar.Parent = main
+Instance.new("UICorner", bar).CornerRadius = UDim.new(0, 12)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -70, 1, 0)
+title.Position = UDim2.fromOffset(12, 0)
+title.BackgroundTransparency = 1
+title.Text = "🍬 Auto Farm v6.2"
+title.TextColor3 = Color3.fromRGB(255, 130, 30)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 13
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = bar
+
+local function smallBtn(text, x, color)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.fromOffset(26, 26)
+    b.Position = UDim2.new(1, x, 0, 4)
+    b.BackgroundColor3 = color
+    b.Text = text
+    b.TextColor3 = Color3.new(1,1,1)
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 13
+    b.BorderSizePixel = 0
+    b.Parent = bar
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    return b
+end
+
+local hideBtn  = smallBtn("—", -60, Color3.fromRGB(60, 40, 90))
+local closeBtn = smallBtn("✕", -30, Color3.fromRGB(200, 40, 40))
+
+local mini = Instance.new("TextButton")
+mini.Size = UDim2.fromOffset(50, 50)
+mini.Position = UDim2.new(0, 16, 0.5, -25)
+mini.BackgroundColor3 = Color3.fromRGB(255, 100, 0)
+mini.Text = "🍬"
+mini.Font = Enum.Font.GothamBold
+mini.TextSize = 22
+mini.BorderSizePixel = 0
+mini.Visible = false
+mini.Parent = gui
+Instance.new("UICorner", mini).CornerRadius = UDim.new(0, 12)
+
+local body = Instance.new("Frame")
+body.Size = UDim2.new(1, -20, 1, -44)
+body.Position = UDim2.fromOffset(10, 40)
+body.BackgroundTransparency = 1
+body.Parent = main
+
+-- Start / stop
+local toggle = Instance.new("TextButton")
+toggle.Size = UDim2.new(1, 0, 0, 34)
+toggle.BackgroundColor3 = Color3.fromRGB(0, 190, 80)
+toggle.Text = "▶ START"
+toggle.TextColor3 = Color3.new(1,1,1)
+toggle.Font = Enum.Font.GothamBold
+toggle.TextSize = 13
+toggle.BorderSizePixel = 0
+toggle.Parent = body
+Instance.new("UICorner", toggle).CornerRadius = UDim.new(0, 8)
+
+-- Mode row (4 buttons)
+local modeRow = Instance.new("Frame")
+modeRow.Size = UDim2.new(1, 0, 0, 30)
+modeRow.Position = UDim2.fromOffset(0, 42)
+modeRow.BackgroundTransparency = 1
+modeRow.Parent = body
+
+local function modeBtn(text, x)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(0.24, 0, 1, 0)
+    b.Position = UDim2.new(x, 0, 0, 0)
+    b.BackgroundColor3 = Color3.fromRGB(40, 28, 60)
+    b.Text = text
+    b.TextColor3 = Color3.new(1,1,1)
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 10
+    b.BorderSizePixel = 0
+    b.Parent = modeRow
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    return b
+end
+
+local walkBtn    = modeBtn("Walk",    0)
+local tweenBtn   = modeBtn("Tween",   0.25)
+local tweenUpBtn = modeBtn("T↕ Skip", 0.50)
+local instantBtn = modeBtn("Instant", 0.75)
+walkBtn.BackgroundColor3 = Color3.fromRGB(255, 100, 0)
+
+-- Speed row
+local speedLbl = Instance.new("TextLabel")
+speedLbl.Size = UDim2.new(0.5, 0, 0, 18)
+speedLbl.Position = UDim2.fromOffset(0, 80)
+speedLbl.BackgroundTransparency = 1
+speedLbl.Text = "Speed:"
+speedLbl.TextColor3 = Color3.fromRGB(180, 160, 210)
+speedLbl.Font = Enum.Font.GothamBold
+speedLbl.TextSize = 11
+speedLbl.TextXAlignment = Enum.TextXAlignment.Left
+speedLbl.Parent = body
+
+local speedBox = Instance.new("TextBox")
+speedBox.Size = UDim2.new(0.45, 0, 0, 20)
+speedBox.Position = UDim2.new(0.55, 0, 0, 79)
+speedBox.BackgroundColor3 = Color3.fromRGB(30, 20, 48)
+speedBox.Text = tostring(CONFIG.speed)
+speedBox.TextColor3 = Color3.fromRGB(255, 130, 30)
+speedBox.Font = Enum.Font.GothamBold
+speedBox.TextSize = 12
+speedBox.BorderSizePixel = 0
+speedBox.Parent = body
+Instance.new("UICorner", speedBox).CornerRadius = UDim.new(0, 5)
+
+-- Presets
+local presets = {50, 100, 200, 500, 1000}
+local presetRow = Instance.new("Frame")
+presetRow.Size = UDim2.new(1, 0, 0, 22)
+presetRow.Position = UDim2.fromOffset(0, 104)
+presetRow.BackgroundTransparency = 1
+presetRow.Parent = body
+
+local presetButtons = {}
+for i, spd in ipairs(presets) do
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(0.19, 0, 1, 0)
+    b.Position = UDim2.new((i-1) * 0.202, 0, 0, 0)
+    b.BackgroundColor3 = Color3.fromRGB(40, 28, 60)
+    b.Text = tostring(spd)
+    b.TextColor3 = Color3.new(1,1,1)
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 10
+    b.BorderSizePixel = 0
+    b.Parent = presetRow
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
+    presetButtons[#presetButtons + 1] = { btn = b, value = spd }
+end
+
+-- Sky height / vertical skip distance
+local skyLbl = Instance.new("TextLabel")
+skyLbl.Size = UDim2.new(0.6, 0, 0, 18)
+skyLbl.Position = UDim2.fromOffset(0, 132)
+skyLbl.BackgroundTransparency = 1
+skyLbl.Text = "Skip Height (T↕):"
+skyLbl.TextColor3 = Color3.fromRGB(180, 160, 210)
+skyLbl.Font = Enum.Font.GothamBold
+skyLbl.TextSize = 10
+skyLbl.TextXAlignment = Enum.TextXAlignment.Left
+skyLbl.Parent = body
+
+local skyBox = Instance.new("TextBox")
+skyBox.Size = UDim2.new(0.35, 0, 0, 20)
+skyBox.Position = UDim2.new(0.65, 0, 0, 131)
+skyBox.BackgroundColor3 = Color3.fromRGB(30, 20, 48)
+skyBox.Text = tostring(CONFIG.skyHeight)
+skyBox.TextColor3 = Color3.fromRGB(120, 200, 255)
+skyBox.Font = Enum.Font.GothamBold
+skyBox.TextSize = 11
+skyBox.BorderSizePixel = 0
+skyBox.Parent = body
+Instance.new("UICorner", skyBox).CornerRadius = UDim.new(0, 5)
+
+-- Status
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, 0, 0, 26)
+status.Position = UDim2.fromOffset(0, 158)
+status.BackgroundColor3 = Color3.fromRGB(22, 14, 38)
+status.Text = "Idle"
+status.TextColor3 = Color3.fromRGB(150, 220, 150)
+status.Font = Enum.Font.GothamMedium
+status.TextSize = 11
+status.Parent = body
+Instance.new("UICorner", status).CornerRadius = UDim.new(0, 6)
+
+local function setStatus(t, c)
+    status.Text = t
+    if c then status.TextColor3 = c end
+end
+
+-- Info
+local info = Instance.new("TextLabel")
+info.Size = UDim2.new(1, 0, 0, 50)
+info.Position = UDim2.fromOffset(0, 190)
+info.BackgroundTransparency = 1
+info.Text = "Walk: safe • Tween: smooth path\nT↕ Skip: over/under walls • Instant: snap"
+info.TextColor3 = Color3.fromRGB(140, 120, 170)
+info.Font = Enum.Font.Gotham
+info.TextSize = 9
+info.TextYAlignment = Enum.TextYAlignment.Top
+info.Parent = body
+
+-- ------------------------------------------------------------
+-- GUI HANDLERS
+-- ------------------------------------------------------------
+local function setSpeed(v)
+    CONFIG.speed = math.clamp(math.floor(v), 1, 100000)
+    speedBox.Text = tostring(CONFIG.speed)
+    for _, pb in ipairs(presetButtons) do
+        pb.btn.BackgroundColor3 = (pb.value == CONFIG.speed)
+            and Color3.fromRGB(255, 100, 0)
+            or  Color3.fromRGB(40, 28, 60)
+    end
+end
+setSpeed(CONFIG.speed)
+
+local function setSkyHeight(v)
+    CONFIG.skyHeight = math.clamp(math.floor(v), 10, 5000)
+    skyBox.Text = tostring(CONFIG.skyHeight)
+end
+
+local function setMode(name, btn)
+    CONFIG.mode = name
+    walkBtn.BackgroundColor3    = Color3.fromRGB(40, 28, 60)
+    tweenBtn.BackgroundColor3   = Color3.fromRGB(40, 28, 60)
+    tweenUpBtn.BackgroundColor3 = Color3.fromRGB(40, 28, 60)
+    instantBtn.BackgroundColor3 = Color3.fromRGB(40, 28, 60)
+    btn.BackgroundColor3 = Color3.fromRGB(255, 100, 0)
+end
+
+toggle.MouseButton1Click:Connect(function()
+    state.running = not state.running
+    toggle.Text = state.running and "⏸ STOP" or "▶ START"
+    toggle.BackgroundColor3 = state.running
+        and Color3.fromRGB(200, 50, 50)
+        or  Color3.fromRGB(0, 190, 80)
+    setStatus(state.running and "Running..." or "Idle")
+end)
+
+walkBtn.MouseButton1Click:Connect(function()    setMode("Walk",    walkBtn)    end)
+tweenBtn.MouseButton1Click:Connect(function()   setMode("Tween",   tweenBtn)   end)
+tweenUpBtn.MouseButton1Click:Connect(function() setMode("TweenUp", tweenUpBtn) end)
+instantBtn.MouseButton1Click:Connect(function() setMode("Instant", instantBtn) end)
+
+for _, pb in ipairs(presetButtons) do
+    pb.btn.MouseButton1Click:Connect(function() setSpeed(pb.value) end)
+end
+
+speedBox.FocusLost:Connect(function()
+    local n = tonumber(speedBox.Text)
+    if n then setSpeed(n) else speedBox.Text = tostring(CONFIG.speed) end
+end)
+
+skyBox.FocusLost:Connect(function()
+    local n = tonumber(skyBox.Text)
+    if n then setSkyHeight(n) else skyBox.Text = tostring(CONFIG.skyHeight) end
+end)
+
+hideBtn.MouseButton1Click:Connect(function()  main.Visible = false; mini.Visible = true  end)
+mini.MouseButton1Click:Connect(function()     main.Visible = true;  mini.Visible = false end)
+closeBtn.MouseButton1Click:Connect(function() gui:Destroy() end)
+
+-- Drag via title bar
+local drag, dragStart, startPos
+bar.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1
+    or i.UserInputType == Enum.UserInputType.Touch then
+        drag = true
+        dragStart = i.Position
+        startPos = main.Position
+        i.Changed:Connect(function()
+            if i.UserInputState == Enum.UserInputState.End then drag = false end
+        end)
+    end
+end)
+UserInputService.InputChanged:Connect(function(i)
+    if not drag then return end
+    if i.UserInputType == Enum.UserInputType.MouseMovement
+    or i.UserInputType == Enum.UserInputType.Touch then
+        local d = i.Position - dragStart
+        main.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + d.X,
+            startPos.Y.Scale, startPos.Y.Offset + d.Y
+        )
+    end
+end)
+
+-- ------------------------------------------------------------
+-- MAIN LOOP
+-- ------------------------------------------------------------
+local function farmOnce()
+    if not state.running or state.busy or not hrp or not hrp.Parent then return end
+    state.busy = true
+
+    local prompts = scan()
+    local valid = {}
+    for _, p in ipairs(prompts) do
+        if no
